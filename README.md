@@ -655,6 +655,5 @@ Exit code: `1`
 
 ---
 
-## License
-
-MIT
+## Link github
+https://github.com/tuandat1110/OpenWRT.git
