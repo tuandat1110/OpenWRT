@@ -15,6 +15,7 @@ Tiện ích kiểm tra phiên bản Python 3.9 viết bằng C, được đóng 
 - [Luồng hoạt động](#luồng-hoạt-động)
 - [Output mẫu](#output-mẫu)
 - [Thông tin phiên bản](#thông-tin-phiên-bản)
+- [Giả lập Raspberry Pi 4 bằng Docker ARM64](#giả-lập-raspberry-pi-4-bằng-docker-arm64)
 
 ---
 
@@ -652,6 +653,183 @@ Exit code: `1`
 | OpenWRT SDK | `v23.05.2` — `bcm27xx/bcm2711` |
 | Target Platform | Raspberry Pi 4B (`aarch64_cortex-a72`) |
 | Commit format | Conventional Commits: `feat:` / `fix:` / `docs:` |
+
+---
+
+## Giả lập Raspberry Pi 4 bằng Docker ARM64
+
+Phần này hướng dẫn dùng Docker để giả lập môi trường ARM64 (giống Raspberry Pi 4B) ngay trên máy x86_64 — **không cần phần cứng thật, không cần QEMU cài riêng** — rồi ném file `.ipk` vào chạy thử `check_python`.
+
+> **Tại sao Docker thay vì QEMU VM?**
+> Docker + `binfmt_misc` nhẹ hơn nhiều so với QEMU full system emulation. Không cần tải image OpenWRT, không cần cấu hình network ảo. Phù hợp để kiểm tra nhanh binary `.ipk` trước khi deploy lên board thật.
+
+---
+
+### Yêu cầu bổ sung
+
+| Công cụ | Ghi chú |
+|---------|---------|
+| Docker 20.10+ | Đã có sẵn từ phần Yêu cầu chính |
+| `tonistiigi/binfmt` | Kích hoạt QEMU ARM64 trong kernel host — chạy 1 lần |
+
+---
+
+### Bước 1 — Kích hoạt QEMU ARM64 trên máy host
+
+Lệnh này nạp bộ dịch tập lệnh ARM64 vào kernel của máy thật. Cần chạy lại mỗi khi khởi động lại máy hoặc khởi động lại Docker daemon:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install all
+```
+
+Kiểm tra kích hoạt thành công:
+
+```bash
+ls /proc/sys/fs/binfmt_misc/ | grep aarch64
+# Phải thấy: qemu-aarch64
+```
+
+---
+
+### Bước 2 — Dockerfile giả lập Pi 4
+
+File `Dockerfile` trong repo này đã được chuẩn bị sẵn. Nó thực hiện:
+
+1. Dùng Alpine Linux ARM64 làm base (nhẹ, gần với môi trường musl của OpenWRT)
+2. Copy file `.ipk` vào container
+3. Giải nén `.ipk` thủ công (vì Alpine không có `opkg`)
+4. Cài Python 3 và tạo symlink `python3.9`
+
+```dockerfile
+FROM --platform=linux/arm64 alpine:latest
+
+WORKDIR /tmp
+
+COPY check_python_1.0-1_aarch64_cortex-a72.ipk /tmp/
+
+RUN tar -xvf check_python_1.0-1_aarch64_cortex-a72.ipk && \
+    tar -xvf data.tar.gz && \
+    cp ./usr/bin/check_python /usr/bin/ && \
+    apk update && apk add python3 && \
+    ln -sf /usr/bin/python3 /usr/bin/python3.9
+
+CMD ["/bin/sh"]
+```
+
+> **Tại sao giải nén `.ipk` thủ công thay vì dùng `opkg install`?**
+> Alpine Linux không có `opkg` (package manager của OpenWRT). File `.ipk` thực chất là archive `tar` lồng nhau: ngoài cùng là `tar`, bên trong có `data.tar.gz` chứa binary. Giải nén thủ công hoàn toàn tương đương với `opkg install`.
+
+> **Tại sao tạo symlink `python3.9`?**
+> Alpine cài Python 3 vào `/usr/bin/python3`. Binary `check_python` gọi `python3.9` theo tên cụ thể — symlink này làm cho lệnh `which python3.9` trả về kết quả thành công, đúng như logic trong `check_python.c`.
+
+---
+
+### Bước 3 — Build image ARM64
+
+Đặt file `.ipk` vào cùng thư mục với `Dockerfile`, sau đó build:
+
+```bash
+# Bỏ --platform trong lệnh build (đã có trong FROM của Dockerfile)
+docker build -t my-openwrt-pi4-image .
+```
+
+Hoặc nếu muốn ép platform từ CLI (bỏ `--platform` trong Dockerfile trước):
+
+```bash
+docker build --platform linux/arm64 -t my-openwrt-pi4-image .
+```
+
+> **Lỗi `exec /bin/sh: exec format error` khi build?**
+> QEMU binfmt bị mất hiệu lực (thường sau khi restart Docker hoặc reboot). Chạy lại lệnh ở Bước 1 là xong.
+
+---
+
+### Bước 4 — Chạy container và test
+
+```bash
+# Xóa container cũ nếu tên bị trùng
+docker rm -f my-pi4-container
+
+# Khởi chạy container ARM64 ở chế độ nền
+docker run -dit --name my-pi4-container my-openwrt-pi4-image
+
+# Vào bên trong
+docker exec -it my-pi4-container /bin/sh
+```
+
+Bên trong container, kiểm tra:
+
+```sh
+# Chạy binary check_python
+check_python
+# → Detected Python Version: Python 3.9.x
+
+# Xem log được ghi
+cat /tmp/python_ver.log
+# → Python 3.9.x
+
+# Kiểm tra exit code
+check_python; echo "Exit code: $?"
+# → Exit code: 0
+```
+
+---
+
+### Bước 5 — Ném file `.ipk` mới vào container đang chạy
+
+Khi có file `.ipk` mới (sau `make package`) và muốn test mà không cần rebuild image:
+
+```bash
+# Copy .ipk vào container đang chạy
+docker cp check_python_1.0-1_aarch64_cortex-a72.ipk my-pi4-container:/tmp/
+
+# Vào container và cài thủ công
+docker exec -it my-pi4-container /bin/sh -c "
+  cd /tmp && \
+  tar -xvf check_python_1.0-1_aarch64_cortex-a72.ipk && \
+  tar -xvf data.tar.gz && \
+  cp ./usr/bin/check_python /usr/bin/ && \
+  check_python
+"
+```
+
+---
+
+### Sơ đồ luồng giả lập
+
+```
+HOST (x86_64)
+│
+├─ docker run tonistiigi/binfmt --install all
+│   └─► Nạp qemu-aarch64 vào kernel host (binfmt_misc)
+│
+├─ docker build --platform linux/arm64
+│   ├─ FROM alpine:latest  (ARM64 image)
+│   ├─ COPY .ipk → /tmp/
+│   ├─ RUN tar xvf → giải nén binary ARM64
+│   ├─ RUN apk add python3 → cài Python
+│   └─ RUN ln -sf → tạo symlink python3.9
+│
+└─ docker run my-openwrt-pi4-image
+    └─► Shell ARM64 (Alpine musl) giả lập qua QEMU
+            └─ check_python  ← binary aarch64_cortex-a72
+                    ├─ which python3.9  → /usr/bin/python3.9 ✓
+                    ├─ python3.9 --version → "Python 3.9.x"
+                    ├─ stdout: "Detected Python Version: Python 3.9.x"
+                    └─ /tmp/python_ver.log ← ghi log
+```
+
+---
+
+### Troubleshooting
+
+| Lỗi | Nguyên nhân | Cách xử lý |
+|-----|-------------|------------|
+| `exec format error` khi build | QEMU binfmt chưa được kích hoạt hoặc bị reset | Chạy lại lệnh `tonistiigi/binfmt` ở Bước 1 |
+| `Could not open ld-musl-aarch64.so.1` | Chạy binary ARM64 trực tiếp trên host không qua container | Chạy trong container ARM64 như hướng dẫn |
+| `check_python: not found` | Binary chưa được copy vào `/usr/bin` | Kiểm tra bước `cp ./usr/bin/check_python /usr/bin/` |
+| `Error: Python 3.9 not found` | Symlink `python3.9` chưa được tạo | Chạy `ln -sf /usr/bin/python3 /usr/bin/python3.9` trong container |
+| Container tên bị trùng | Container cũ chưa xóa | `docker rm -f my-pi4-container` |
 
 ---
 
